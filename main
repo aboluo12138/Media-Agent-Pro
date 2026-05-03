@@ -1,0 +1,247 @@
+import os
+import json
+import uuid
+import threading
+import sqlite3
+from datetime import datetime
+from flask import Flask, request, render_template_string, jsonify, send_file
+from openai import OpenAI
+
+app = Flask(__name__)
+
+# --- 配置与初始化 ---
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+DB_PATH = "media_agent.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS articles 
+            (id TEXT PRIMARY KEY, topic TEXT, status TEXT, 
+             data TEXT, created_at DATETIME)''')
+init_db()
+
+# --- 核心 Agent 逻辑 ---
+
+def run_full_generation_task(task_id, topic):
+    """后台运行的长任务：文案 + 图像生成"""
+    try:
+        # 1. 生成文案
+        prompt = f"你是一个全能自媒体专家，请针对《{topic}》创作。输出JSON: {{'titles':[], 'article':'markdown', 'redbook':'emoji文案', 'img_prompt':'prompt'}}"
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        content = json.loads(response.choices[0].message.content)
+
+        # 2. 生成图像
+        img_response = client.images.generate(
+            model="dall-e-3",
+            prompt=f"Professional social media cover, vibrant, clean: {content['img_prompt']}",
+            n=1, size="1024x1024"
+        )
+        content['image_url'] = img_response.data[0].url
+
+        # 3. 更新数据库
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE articles SET status='completed', data=? WHERE id=?", 
+                         (json.dumps(content), task_id))
+    except Exception as e:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE articles SET status='failed', data=? WHERE id=?", 
+                         (str(e), task_id))
+
+# --- 路由设置 ---
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_MVP)
+
+@app.route('/api/generate', methods=['POST'])
+def api_generate():
+    topic = request.json.get('topic')
+    task_id = str(uuid.uuid4())[:8]
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO articles VALUES (?, ?, ?, ?, ?)", 
+                     (task_id, topic, 'processing', None, datetime.now()))
+    
+    # 开启后台线程，不阻塞主流程
+    thread = threading.Thread(target=run_full_generation_task, args=(task_id, topic))
+    thread.start()
+    
+    return jsonify({"task_id": task_id})
+
+@app.route('/api/status/<task_id>')
+def api_status(task_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status, data, topic FROM articles WHERE id=?", (task_id,))
+        row = cur.fetchone()
+    
+    if not row: return jsonify({"error": "Not found"}), 404
+    return jsonify({"status": row[0], "data": json.loads(row[1]) if row[1] else None, "topic": row[2]})
+
+@app.route('/api/history')
+def api_history():
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, topic, created_at FROM articles ORDER BY created_at DESC")
+        rows = cur.fetchall()
+    return jsonify([{"id": r[0], "topic": r[1], "date": r[2]} for r in rows])
+
+# --- MVP 前端模板 (集成侧边栏与状态管理) ---
+HTML_MVP = '''
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Media Agent MVP</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        .loading-ring { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="bg-gray-100 flex h-screen overflow-hidden">
+    <!-- 侧边栏：历史记录 -->
+    <div class="w-64 bg-slate-900 text-white flex flex-col">
+        <div class="p-6 font-bold text-xl border-b border-slate-700">📜 创作历史</div>
+        <div id="historyList" class="flex-1 overflow-y-auto p-4 space-y-2 text-sm text-slate-400">
+            加载中...
+        </div>
+    </div>
+
+    <!-- 主操作区 -->
+    <div class="flex-1 flex flex-col overflow-y-auto">
+        <header class="bg-white border-b px-8 py-4 flex justify-between items-center">
+            <h1 class="text-xl font-bold">Media Agent <span class="text-blue-500">MVP</span></h1>
+            <button onclick="newDraft()" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm">+ 新建创作</button>
+        </header>
+
+        <main class="p-8 max-w-5xl mx-auto w-full">
+            <!-- 输入框 -->
+            <div id="inputSection" class="bg-white rounded-xl shadow-sm p-6 mb-8">
+                <h2 class="text-lg font-bold mb-4">你想创作什么内容？</h2>
+                <div class="flex gap-4">
+                    <input type="text" id="topicInput" class="flex-1 border rounded-lg px-4 py-2 outline-none focus:ring-2 focus:ring-blue-400" placeholder="例如：给普通人的10个理财建议">
+                    <button onclick="startGenerate()" id="genBtn" class="bg-slate-800 text-white px-6 py-2 rounded-lg font-bold">立即生成</button>
+                </div>
+            </div>
+
+            <!-- 生成中状态 -->
+            <div id="loadingState" class="hidden flex flex-col items-center py-20">
+                <div class="loading-ring mb-4"></div>
+                <p class="text-slate-500 animate-pulse">Agent 正在查阅资料、撰写文案并绘制封面图，请稍候...</p>
+            </div>
+
+            <!-- 结果展示 -->
+            <div id="resultSection" class="hidden space-y-6 pb-20">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                    <div class="md:col-span-1 bg-white p-4 rounded-xl shadow-sm">
+                        <img id="resImg" class="w-full aspect-square rounded-lg object-cover mb-4" src="">
+                        <button onclick="copy('redbook')" class="w-full bg-orange-100 text-orange-600 py-2 rounded font-bold text-sm">复制小红书文案</button>
+                    </div>
+                    <div class="md:col-span-2 bg-white p-6 rounded-xl shadow-sm">
+                        <h3 class="text-slate-400 text-xs font-bold uppercase mb-4 tracking-widest">备选爆款标题</h3>
+                        <div id="resTitles" class="space-y-2"></div>
+                    </div>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm">
+                    <div class="border-b px-6 py-4 flex justify-between items-center">
+                        <span class="font-bold text-slate-700">文章预览 (Markdown)</span>
+                        <button onclick="copy('article')" class="text-blue-600 text-sm font-medium">复制正文</button>
+                    </div>
+                    <div id="resArticle" class="p-8 prose max-w-none"></div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        let currentTask = null;
+        let pollInterval = null;
+
+        // 初始化加载历史
+        loadHistory();
+
+        function loadHistory() {
+            fetch('/api/history').then(res => res.json()).then(data => {
+                const list = document.getElementById('historyList');
+                list.innerHTML = data.map(item => `
+                    <div onclick="viewTask('${item.id}')" class="p-2 hover:bg-slate-800 rounded cursor-pointer transition-colors border-b border-slate-800 pb-2">
+                        <div class="text-white truncate">${item.topic}</div>
+                        <div class="text-[10px] text-slate-500">${item.date}</div>
+                    </div>
+                `).join('');
+            });
+        }
+
+        function startGenerate() {
+            const topic = document.getElementById('topicInput').value;
+            if(!topic) return;
+
+            document.getElementById('inputSection').classList.add('hidden');
+            document.getElementById('loadingState').classList.remove('hidden');
+
+            fetch('/api/generate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({topic})
+            }).then(res => res.json()).then(data => {
+                currentTask = data.task_id;
+                pollStatus();
+            });
+        }
+
+        function pollStatus() {
+            pollInterval = setInterval(() => {
+                fetch(`/api/status/${currentTask}`).then(res => res.json()).then(res => {
+                    if(res.status === 'completed') {
+                        clearInterval(pollInterval);
+                        showResult(res.data);
+                        loadHistory();
+                    } else if(res.status === 'failed') {
+                        clearInterval(pollInterval);
+                        alert('生成失败: ' + res.data);
+                    }
+                });
+            }, 3000);
+        }
+
+        function showResult(data) {
+            document.getElementById('loadingState').classList.add('hidden');
+            document.getElementById('resultSection').classList.remove('hidden');
+            document.getElementById('resImg').src = data.image_url;
+            document.getElementById('resTitles').innerHTML = data.titles.map(t => `<div class="p-3 bg-slate-50 border rounded-lg">🔥 ${t}</div>`).join('');
+            document.getElementById('resArticle').innerHTML = marked.parse(data.article);
+            window.currentContent = data; // 暂存用于复制
+        }
+
+        function viewTask(id) {
+            document.getElementById('inputSection').classList.add('hidden');
+            document.getElementById('loadingState').classList.remove('hidden');
+            document.getElementById('resultSection').classList.add('hidden');
+            currentTask = id;
+            fetch(`/api/status/${id}`).then(res => res.json()).then(res => {
+                showResult(res.data);
+            });
+        }
+
+        function newDraft() {
+            location.reload();
+        }
+
+        function copy(type) {
+            const text = type === 'article' ? window.currentContent.article : window.currentContent.redbook;
+            navigator.clipboard.writeText(text);
+            alert('已成功复制到剪贴板！');
+        }
+    </script>
+</body>
+</html>
+'''
+
+if __name__ == '__main__':
+    app.run(debug=True, port=8000)
