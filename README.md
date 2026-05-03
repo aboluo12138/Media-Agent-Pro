@@ -3,6 +3,7 @@
 🚀 Media Agent Pro: 全媒体矩阵内容生产助手 (MVP)
 
 Media Agent Pro 是一个基于大语言模型 (LLM) 的全栈自媒体内容生产工作站。它能够将一个模糊的“选题”转化为包含爆款标题矩阵、深度长文、多平台改编文案以及 AI 生成封面图的完整作品集。
+
 ✨ 核心特性
 
     ⚡ 异步生成架构：采用多线程处理。用户提交任务后无需守在网页前，AI 会在后台完成调研、撰写和绘图。
@@ -29,7 +30,7 @@ Media Agent Pro 是一个基于大语言模型 (LLM) 的全栈自媒体内容生
 1. 克隆项目
 Bash
 
-git clone https://github.com/your-username/media-agent-pro.git
+git clone https://github.com/aboluo12138/Media-Agent-Pro.git
 cd media-agent-pro
 
 2. 安装依赖
